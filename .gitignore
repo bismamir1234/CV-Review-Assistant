@@ -1,0 +1,22 @@
+# Virtual environments
+.venv/
+*/.venv/
+
+# Node dependencies
+node_modules/
+*/node_modules/
+
+# Python cache & databases
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite3
+
+# Build & Vite artifacts
+dist/
+build/
+.vite/
+
+# Environment files
+.env
