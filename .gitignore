@@ -12,6 +12,8 @@ __pycache__/
 *.pyo
 *.db
 *.sqlite3
+.pytest_cache/
+*/.pytest_cache/
 
 # Build & Vite artifacts
 dist/

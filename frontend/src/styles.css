@@ -2010,3 +2010,52 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* Feature 1 & 2 Custom UI Extensions */
+.action-control-btn {
+  transition: var(--transition);
+  outline: none;
+}
+.action-control-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.15);
+}
+.action-control-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+.action-control-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.match-btn {
+  background: rgba(16, 185, 129, 0.12);
+  color: var(--success);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+.match-btn:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.22);
+  border-color: var(--success);
+  color: var(--success);
+  box-shadow: 0 4px 16px var(--success-glow);
+}
+
+.status-accepted {
+  background: rgba(16, 185, 129, 0.03);
+}
+.status-rejected {
+  opacity: 0.65;
+  background: rgba(239, 68, 68, 0.03);
+}
+.status-edited {
+  background: rgba(56, 189, 248, 0.04);
+}
+
+.input-field-label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+

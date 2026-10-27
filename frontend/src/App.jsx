@@ -6,7 +6,7 @@ const API = "http://127.0.0.1:8000";
 export default function App() {
   // Theme state: dark by default
   const [theme, setTheme] = useState(() => localStorage.getItem("rm_theme") || "dark");
-  
+
   // Backend health state
   const [backendHealth, setBackendHealth] = useState({
     checked: false,
@@ -19,22 +19,32 @@ export default function App() {
   const [file, setFile] = useState(null);
   const [dragActive, setDragActive] = useState(false);
   const [jobDescription, setJobDescription] = useState("");
+  const [targetRole, setTargetRole] = useState("");
   const [status, setStatus] = useState("empty"); // "empty" | "loading" | "success" | "error"
   const [loadingStep, setLoadingStep] = useState(1);
+  const [loadingMessage, setLoadingMessage] = useState("Analyzing your document...");
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  const [extractedText, setExtractedText] = useState("");
   const [editedText, setEditedText] = useState("");
-  const [busy, setBusy] = useState(false);
-  
+  const [busyReview, setBusyReview] = useState(false);
+  const [busyMatch, setBusyMatch] = useState(false);
+
+  // Suggestions with individual state management (accept/reject/edit)
+  const [suggestions, setSuggestions] = useState([]);
+  const [suggestionCategoryFilter, setSuggestionCategoryFilter] = useState("all");
+  const [suggestionStatusFilter, setSuggestionStatusFilter] = useState("all");
+
+  // Job matching result state
+  const [jobMatch, setJobMatch] = useState(null);
+
   // UI views & tabs
   const [activeTab, setActiveTab] = useState("audit"); // "audit" | "bullet_studio" | "architecture"
-  const [suggestionCategoryFilter, setSuggestionCategoryFilter] = useState("all");
   const [editorViewMode, setEditorViewMode] = useState("split"); // "split" | "editor" | "preview"
   const [toastMessage, setToastMessage] = useState("");
 
   // Bullet studio state
   const [studioInput, setStudioInput] = useState("");
-  const [studioCategory, setStudioCategory] = useState("backend");
   const [studioOutputs, setStudioOutputs] = useState(null);
 
   const fileInputRef = useRef(null);
@@ -127,7 +137,6 @@ export default function App() {
     if (!profile) return;
 
     try {
-      // Fetch the sample DOCX file hosted in public directory
       const response = await fetch("/sample_resume.docx");
       if (!response.ok) throw new Error("Could not fetch sample resume file");
       const blob = await response.blob();
@@ -136,65 +145,182 @@ export default function App() {
       });
       setFile(sampleFile);
       setJobDescription(profile.jobPreset);
+      setTargetRole(profile.role || "");
       setError("");
       setStatus("empty");
       showToast(`Loaded ${profile.name}'s profile & role requirements`);
     } catch {
-      // Fallback: create mock blob
-      showToast(`Selected ${profile.name}. Please click Review CV.`);
+      showToast(`Selected ${profile.name}. Please upload or review CV.`);
     }
   }
 
-  // Review submission
+  // Feature 1: Submit CV for AI Review
   async function submitReview(event) {
     if (event) event.preventDefault();
 
-    if (!file) {
-      setError("Please select or drop a DOCX CV before submitting.");
+    if (!file && !extractedText) {
+      setError("Please select or drop a DOCX CV before submitting for review.");
       setStatus("error");
       return;
     }
 
-    setBusy(true);
+    setBusyReview(true);
     setStatus("loading");
     setLoadingStep(1);
+    setLoadingMessage("Extracting text and running AI writing review…");
     setError("");
-    setResult(null);
 
-    // Simulate multi-step progress feedback for better user experience
     const progressTimer = setInterval(() => {
       setLoadingStep((prev) => (prev < 3 ? prev + 1 : prev));
     }, 450);
 
-    const form = new FormData();
-    form.append("cv_file", file);
-    form.append("job_description", jobDescription);
-
     try {
-      const response = await fetch(`${API}/api/reviews`, {
-        method: "POST",
-        body: form
-      });
-      const body = await response.json();
-      clearInterval(progressTimer);
+      let dataResult = null;
 
-      if (!response.ok) {
-        throw new Error(body.detail || "Review request failed.");
+      if (file) {
+        const form = new FormData();
+        form.append("cv_file", file);
+        form.append("job_description", jobDescription);
+
+        const response = await fetch(`${API}/api/reviews`, {
+          method: "POST",
+          body: form
+        });
+        const body = await response.json();
+        clearInterval(progressTimer);
+
+        if (!response.ok) {
+          throw new Error(body.detail || "Review request failed.");
+        }
+        dataResult = body;
+        setResult(body);
+        setExtractedText(body.extracted_text || "");
+        if (!editedText) setEditedText(body.extracted_text || "");
+
+        // Initialize suggestions with state tracking
+        const rawSuggs = body.analysis?.suggestions || [];
+        setSuggestions(
+          rawSuggs.map((s, idx) => ({
+            ...s,
+            id: s.id || `sugg-${idx + 1}`,
+            status: s.status || "pending",
+            isEditing: false,
+            editText: s.suggested_rewrite || s.suggested || ""
+          }))
+        );
+
+        if (body.analysis?.job_match) {
+          setJobMatch(body.analysis.job_match);
+        }
+      } else {
+        // Direct text review endpoint
+        const response = await fetch(`${API}/api/cv/review`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cv_text: extractedText, target_role: targetRole || jobDescription.slice(0, 200) })
+        });
+        const body = await response.json();
+        clearInterval(progressTimer);
+
+        if (!response.ok) {
+          throw new Error(body.detail || "CV Review failed.");
+        }
+
+        const rawSuggs = body.suggestions || [];
+        setSuggestions(
+          rawSuggs.map((s, idx) => ({
+            ...s,
+            id: s.id || `sugg-${idx + 1}`,
+            status: "pending",
+            isEditing: false,
+            editText: s.suggested_rewrite || s.suggested || ""
+          }))
+        );
       }
 
-      setResult(body);
-      setEditedText(body.analysis?.revised_text || body.extracted_text || "");
       setStatus("success");
       showToast("CV Review completed successfully!");
     } catch (err) {
       clearInterval(progressTimer);
-      setError(
-        err.message ||
-          "Could not connect to the backend server. Verify that FastAPI is running on http://127.0.0.1:8000."
-      );
+      setError(err.message || "Failed to complete CV Review. Check if FastAPI is running.");
       setStatus("error");
     } finally {
-      setBusy(false);
+      setBusyReview(false);
+    }
+  }
+
+  // Feature 2: Submit CV & Job Description for Matching
+  async function submitJobMatch() {
+    if (!jobDescription.trim()) {
+      setError("Please paste a target job description to match your CV against.");
+      setStatus("error");
+      return;
+    }
+
+    const currentText = editedText || extractedText;
+    if (!currentText && !file) {
+      setError("Please upload a CV document first before matching against a job description.");
+      setStatus("error");
+      return;
+    }
+
+    setBusyMatch(true);
+    setStatus("loading");
+    setLoadingStep(2);
+    setLoadingMessage("Comparing CV skills with job description requirements & keywords…");
+    setError("");
+
+    try {
+      let textToMatch = currentText;
+      // If text not yet extracted from file, run the unified review first
+      if (!textToMatch && file) {
+        const form = new FormData();
+        form.append("cv_file", file);
+        form.append("job_description", jobDescription);
+        const resp = await fetch(`${API}/api/reviews`, { method: "POST", body: form });
+        const body = await resp.json();
+        if (!resp.ok) throw new Error(body.detail || "Failed to process file.");
+        setResult(body);
+        setExtractedText(body.extracted_text || "");
+        setEditedText(body.extracted_text || "");
+        textToMatch = body.extracted_text;
+
+        const rawSuggs = body.analysis?.suggestions || [];
+        setSuggestions(
+          rawSuggs.map((s, idx) => ({
+            ...s,
+            id: s.id || `sugg-${idx + 1}`,
+            status: s.status || "pending",
+            isEditing: false,
+            editText: s.suggested_rewrite || s.suggested || ""
+          }))
+        );
+
+        if (body.analysis?.job_match) {
+          setJobMatch(body.analysis.job_match);
+          setStatus("success");
+          showToast("Job Matching analysis complete!");
+          setBusyMatch(false);
+          return;
+        }
+      }
+
+      const matchResp = await fetch(`${API}/api/cv/match-job`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cv_text: textToMatch, job_description: jobDescription })
+      });
+      const matchData = await matchResp.json();
+      if (!matchResp.ok) throw new Error(matchData.detail || "Job matching failed.");
+
+      setJobMatch(matchData);
+      setStatus("success");
+      showToast("Job Matching analysis complete!");
+    } catch (err) {
+      setError(err.message || "Failed to execute Job Matching.");
+      setStatus("error");
+    } finally {
+      setBusyMatch(false);
     }
   }
 
@@ -203,23 +329,104 @@ export default function App() {
     if (result?.id) {
       try {
         await fetch(`${API}/api/reviews/${result.id}`, { method: "DELETE" });
-        showToast("Review record deleted from SQLite database.");
+        showToast("Review record deleted from database.");
       } catch {
-        // UI still clears
+        // UI still resets
       }
     }
     setFile(null);
     setJobDescription("");
+    setTargetRole("");
     setResult(null);
+    setExtractedText("");
     setEditedText("");
+    setSuggestions([]);
+    setJobMatch(null);
     setError("");
     setStatus("empty");
     if (fileInputRef.current) fileInputRef.current.value = "";
+    showToast("Form cleared.");
+  }
+
+  // Individual Suggestion Controls: Accept
+  function handleAcceptSuggestion(id) {
+    const sugg = suggestions.find((s) => s.id === id);
+    if (!sugg) return;
+
+    const orig = sugg.original_statement;
+    const rewrite = sugg.suggested_rewrite;
+
+    if (orig && rewrite) {
+      if (editedText.includes(orig)) {
+        setEditedText((prev) => prev.replace(orig, rewrite));
+      } else {
+        setEditedText((prev) => `${prev}\n\n[Applied Revision]: ${rewrite}`);
+      }
+    }
+
+    setSuggestions((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, status: "accepted", isEditing: false } : s))
+    );
+    showToast(`Accepted suggestion #${id} and updated draft!`);
+  }
+
+  // Individual Suggestion Controls: Reject
+  function handleRejectSuggestion(id) {
+    setSuggestions((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, status: "rejected", isEditing: false } : s))
+    );
+    showToast(`Rejected suggestion #${id}. Original CV text left unchanged.`);
+  }
+
+  // Individual Suggestion Controls: Start Edit
+  function handleStartEdit(id) {
+    setSuggestions((prev) =>
+      prev.map((s) =>
+        s.id === id
+          ? { ...s, isEditing: true, editText: s.suggested_rewrite }
+          : { ...s, isEditing: false }
+      )
+    );
+  }
+
+  // Individual Suggestion Controls: Save Custom Edit
+  function handleSaveCustomEdit(id) {
+    const sugg = suggestions.find((s) => s.id === id);
+    if (!sugg) return;
+
+    const customText = sugg.editText.trim();
+    if (!customText) {
+      showToast("Edit text cannot be empty.");
+      return;
+    }
+
+    const orig = sugg.original_statement;
+    if (orig && editedText.includes(orig)) {
+      setEditedText((prev) => prev.replace(orig, customText));
+    } else {
+      setEditedText((prev) => `${prev}\n\n[Custom Revision]: ${customText}`);
+    }
+
+    setSuggestions((prev) =>
+      prev.map((s) =>
+        s.id === id
+          ? { ...s, suggested_rewrite: customText, status: "edited", isEditing: false }
+          : s
+      )
+    );
+    showToast(`Applied custom edit for suggestion #${id}!`);
+  }
+
+  // Individual Suggestion Controls: Cancel Edit
+  function handleCancelEdit(id) {
+    setSuggestions((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, isEditing: false } : s))
+    );
   }
 
   // Export plain text
   function exportText() {
-    const textToExport = editedText || result?.extracted_text || "";
+    const textToExport = editedText || extractedText || "";
     if (!textToExport) return;
     const blob = new Blob([textToExport], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -238,71 +445,23 @@ export default function App() {
     showToast("Copied CV text to clipboard!");
   }
 
-  // Apply a specific suggestion into the editor text
-  function applySuggestion(original, suggested) {
-    if (!original || !suggested) return;
-    if (editedText.includes(original)) {
-      setEditedText(editedText.replace(original, suggested));
-      showToast("Applied suggestion to editor!");
-    } else {
-      // Append if original not found verbatim
-      setEditedText((prev) => `${prev}\n\n[Applied Revision]: ${suggested}`);
-      showToast("Appended suggestion to editor text.");
-    }
-  }
-
-  // Calculate high-level scoring heuristics for display
-  const metrics = React.useMemo(() => {
-    const text = editedText || result?.extracted_text || "";
-    if (!text) return { score: 0, wordCount: 0, actionVerbs: 0, metricsFound: 0, matchPct: 0 };
-
-    const words = text.split(/\s+/).filter(Boolean);
-    const wordCount = words.length;
-
-    // Check action verbs
-    const powerVerbs = [
-      "architected", "spearheaded", "engineered", "orchestrated", "overhauled",
-      "automated", "optimized", "slashed", "accelerated", "championed", "deployed",
-      "streamlined", "pioneered", "instituted", "formulated", "executed", "mentored",
-      "scaled", "negotiated", "delivered", "generated", "modernized", "refactored"
-    ];
-    let actionVerbs = 0;
-    const lower = text.toLowerCase();
-    powerVerbs.forEach((v) => {
-      if (lower.includes(v)) actionVerbs++;
+  // Filter suggestions
+  const filteredSuggestions = React.useMemo(() => {
+    return suggestions.filter((s) => {
+      const matchCat =
+        suggestionCategoryFilter === "all" ||
+        s.category.toLowerCase().includes(suggestionCategoryFilter.toLowerCase());
+      const matchStat =
+        suggestionStatusFilter === "all" || s.status === suggestionStatusFilter;
+      return matchCat && matchStat;
     });
-
-    // Check numbers/metrics
-    const metricMatches = text.match(/(\d+[\d,.]*[%$kKmMbB]?|\$\d+)/g) || [];
-    const metricsFound = metricMatches.length;
-
-    // Job description match
-    let matchPct = 85;
-    if (jobDescription.trim()) {
-      const jdWords = jobDescription.toLowerCase().match(/\b[a-z]{4,}\b/g) || [];
-      const uniqueJd = [...new Set(jdWords)];
-      let matchedCount = 0;
-      uniqueJd.forEach((w) => {
-        if (lower.includes(w)) matchedCount++;
-      });
-      matchPct = uniqueJd.length > 0 ? Math.min(100, Math.round((matchedCount / uniqueJd.length) * 100)) : 80;
-    }
-
-    let score = 70;
-    if (actionVerbs >= 4) score += 10;
-    if (metricsFound >= 3) score += 10;
-    if (wordCount >= 250 && wordCount <= 900) score += 8;
-    score = Math.min(98, score);
-
-    return { score, wordCount, actionVerbs, metricsFound, matchPct };
-  }, [editedText, result, jobDescription]);
+  }, [suggestions, suggestionCategoryFilter, suggestionStatusFilter]);
 
   // Handle Bullet Studio transformation
   function handleTransformBullet() {
     if (!studioInput.trim()) return;
     const clean = studioInput.trim().replace(/^[-•*–—]\s*/, "");
-    
-    // Generate 3 variations based on formula
+
     const variations = [
       {
         title: "Google XYZ Metric Formula",
@@ -339,14 +498,7 @@ export default function App() {
     ]);
   }
 
-  // Filter suggestions
-  const filteredSuggestions = React.useMemo(() => {
-    if (!result?.analysis?.suggestions) return [];
-    if (suggestionCategoryFilter === "all") return result.analysis.suggestions;
-    return result.analysis.suggestions.filter(
-      (s) => s.category.toLowerCase().includes(suggestionCategoryFilter.toLowerCase())
-    );
-  }, [result, suggestionCategoryFilter]);
+  const busy = busyReview || busyMatch;
 
   return (
     <div className="app-layout">
@@ -375,9 +527,9 @@ export default function App() {
               <div className="brand-title">
                 ResuMetric <span className="brand-accent">AI</span>
               </div>
-              <div className="brand-subtitle">ATS & Recruiter Intelligence Studio</div>
+              <div className="brand-subtitle">AI CV Review & Job Matching Studio</div>
             </div>
-            <span className="version-pill">v1.2 MVP</span>
+            <span className="version-pill">v1.3 Pro</span>
           </div>
 
           {/* Navigation Tabs */}
@@ -386,7 +538,7 @@ export default function App() {
               className={`nav-tab-btn ${activeTab === "audit" ? "active" : ""}`}
               onClick={() => setActiveTab("audit")}
             >
-              CV Audit Studio
+              CV Audit & Job Match
             </button>
             <button
               className={`nav-tab-btn ${activeTab === "bullet_studio" ? "active" : ""}`}
@@ -404,7 +556,6 @@ export default function App() {
 
           {/* Right Header Utilities: Health + Theme */}
           <div className="header-actions">
-            {/* Backend connection pill */}
             <div
               className={`health-badge ${backendHealth.online ? "online" : "offline"}`}
               title={
@@ -419,13 +570,12 @@ export default function App() {
               <span className="health-label">
                 {backendHealth.online
                   ? backendHealth.aiConfigured
-                    ? "FastAPI (AI Active)"
-                    : "FastAPI (Demo Mode)"
+                    ? "FastAPI (Groq AI Active)"
+                    : "FastAPI (Demo Heuristics)"
                   : "API Offline"}
               </span>
             </div>
 
-            {/* Theme Toggle Button */}
             <button
               className="icon-btn theme-toggle"
               onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
@@ -433,7 +583,6 @@ export default function App() {
               title={`Switch to ${theme === "dark" ? "Light" : "Dark"} Mode`}
             >
               {theme === "dark" ? (
-                // Sun icon
                 <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <circle cx="12" cy="12" r="5" />
                   <line x1="12" y1="1" x2="12" y2="3" />
@@ -446,7 +595,6 @@ export default function App() {
                   <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
                 </svg>
               ) : (
-                // Moon icon
                 <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
                 </svg>
@@ -457,87 +605,42 @@ export default function App() {
       </header>
 
       {/* Main Container */}
-      <main className="content-container">
-        {/* TAB 1: CV AUDIT STUDIO */}
+      <main className="main-content">
         {activeTab === "audit" && (
           <>
-            {/* Hero Banner */}
-            <section className="hero-banner">
-              <div className="hero-text-side">
-                <div className="eyebrow-chip">
-                  <span className="dot" /> CAREER INTELLIGENCE · PRIVATE BY DESIGN FOR LOCAL MVP
-                </div>
-                <h1 className="hero-headline">
-                  Elevate Your CV with <span className="gradient-text">Precision ATS Review</span>
-                </h1>
-                <p className="hero-description">
-                  Upload your Word document (.docx), benchmark against target job descriptions, receive
-                  actionable recruiter feedback, edit with a live preview, and export clean plain text.
-                </p>
-                <div className="feature-tags">
-                  <span className="tag-item">✓ DOCX Paragraph & Table Extraction</span>
-                  <span className="tag-item">✓ Fact-Checked Suggestions</span>
-                  <span className="tag-item">✓ Local SQLite Audit History</span>
-                  <span className="tag-item">✓ One-Click Clean Plain Text Export</span>
-                </div>
-              </div>
-
-              <div className="hero-graphic-side">
-                <div className="hero-card-preview">
-                  <img src="/hero.jpg" alt="AI Resume Analytics Engine" className="hero-image" />
-                  <div className="hero-overlay-badge">
-                    <span className="score-number">98%</span>
-                    <span className="score-label">ATS Parsability</span>
-                  </div>
-                </div>
-              </div>
-            </section>
-
-            {/* Benchmark Preset Bar */}
-            <section className="benchmark-bar" aria-label="Sample Profiles">
-              <span className="benchmark-label">1-Click Benchmark Resumes:</span>
-              <div className="benchmark-pills">
-                {SAMPLE_PROFILES.map((p) => (
-                  <button
-                    key={p.id}
-                    type="button"
-                    className="benchmark-btn"
-                    onClick={() => loadPresetProfile(p.id)}
-                  >
-                    <span className="btn-name">{p.name}</span>
-                    <span className="btn-role">{p.badge}</span>
-                  </button>
-                ))}
-                <a
-                  href="/sample_resume.docx"
-                  download="sample_resume.docx"
-                  className="download-sample-link"
-                  title="Download the official test DOCX to your disk"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                    <polyline points="7 10 12 15 17 10" />
-                    <line x1="12" y1="15" x2="12" y2="3" />
-                  </svg>
-                  Download Sample .docx
-                </a>
-              </div>
-            </section>
-
-            {/* Split Input Grid */}
-            <section className="input-grid">
-              {/* Left Column: DOCX Upload */}
+            {/* Top Workspace Form Section */}
+            <section className="form-workspace-grid">
+              {/* Left Column: File Upload */}
               <div className="glass-panel upload-panel">
                 <div className="panel-header">
                   <div className="step-counter">1</div>
                   <div>
-                    <h2 className="panel-title">Upload your CV document</h2>
-                    <p className="panel-subtitle">Supports DOCX only (up to 5 MB) · Extracts text & tables</p>
+                    <h2 className="panel-title">Upload CV Document</h2>
+                    <p className="panel-subtitle">Upload your current resume in Microsoft Word (.docx) format</p>
                   </div>
                 </div>
 
+                {/* Sample Profile Benchmark Chips */}
+                <div className="preset-bar">
+                  <span className="preset-label">Test with Benchmark Profiles:</span>
+                  <div className="preset-chips">
+                    {SAMPLE_PROFILES.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        className="preset-chip-btn"
+                        onClick={() => loadPresetProfile(p.id)}
+                        title={`Load ${p.name}'s sample DOCX CV`}
+                      >
+                        {p.role}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Drag-and-Drop Zone */}
                 <div
-                  className={`drop-area ${dragActive ? "drag-active" : ""} ${file ? "has-file" : ""}`}
+                  className={`drop-zone ${dragActive ? "drag-active" : ""} ${file ? "has-file" : ""}`}
                   onDragEnter={handleDrag}
                   onDragOver={handleDrag}
                   onDragLeave={handleDrag}
@@ -545,7 +648,7 @@ export default function App() {
                   onClick={() => fileInputRef.current?.click()}
                   role="button"
                   tabIndex={0}
-                  aria-label="Upload DOCX CV"
+                  aria-label="Upload DOCX CV file"
                 >
                   <input
                     ref={fileInputRef}
@@ -568,7 +671,7 @@ export default function App() {
                       </div>
                       <div className="file-details">
                         <strong className="file-name">{file.name}</strong>
-                        <span className="file-size">{(file.size / 1024).toFixed(1)} KB · Ready to review</span>
+                        <span className="file-size">{(file.size / 1024).toFixed(1)} KB · Ready for analysis</span>
                       </div>
                       <button
                         type="button"
@@ -599,6 +702,21 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {/* Target Role input */}
+                <div style={{ marginTop: "16px" }}>
+                  <label className="input-field-label" htmlFor="target-role-input">
+                    Target Job Title / Domain (Optional):
+                  </label>
+                  <input
+                    id="target-role-input"
+                    type="text"
+                    className="studio-input"
+                    value={targetRole}
+                    onChange={(e) => setTargetRole(e.target.value)}
+                    placeholder="e.g. Senior Fullstack Engineer / Cloud Architect"
+                  />
+                </div>
               </div>
 
               {/* Right Column: Job Description & Controls */}
@@ -608,9 +726,9 @@ export default function App() {
                   <div className="header-title-row">
                     <div>
                       <h2 className="panel-title">
-                        Target Job Description <span className="optional-badge">Optional</span>
+                        Target Job Description <span className="optional-badge">Optional for Review, Required for Match</span>
                       </h2>
-                      <p className="panel-subtitle">Paste job requirements for tailored keyword gap analysis</p>
+                      <p className="panel-subtitle">Paste target role specifications for deep skill and keyword matching</p>
                     </div>
                     {jobDescription && (
                       <button
@@ -630,19 +748,20 @@ export default function App() {
                   className="job-textarea"
                   value={jobDescription}
                   onChange={(e) => setJobDescription(e.target.value)}
-                  placeholder="Paste target job specifications, required tech stacks, or candidate qualifications here..."
+                  placeholder="Paste target job specifications, required technical stacks, or candidate qualifications here..."
                   rows={6}
                 />
 
-                {/* Submission Action Bar */}
+                {/* Submission Action Bar: Separate Review CV and Match Job buttons */}
                 <div className="submission-actions">
                   <button
                     className="primary-btn review-btn"
                     type="button"
                     onClick={submitReview}
-                    disabled={busy || !file}
+                    disabled={busy || (!file && !extractedText)}
+                    title="Review grammar, clarity, professional tone, and action verbs"
                   >
-                    {busy ? (
+                    {busyReview ? (
                       <>
                         <span className="btn-spinner" /> Reviewing CV…
                       </>
@@ -657,11 +776,33 @@ export default function App() {
                   </button>
 
                   <button
+                    className="secondary-btn match-btn"
+                    type="button"
+                    onClick={submitJobMatch}
+                    disabled={busy || !jobDescription.trim() || (!file && !extractedText)}
+                    title="Compare CV skills and experience against the target job requirements"
+                  >
+                    {busyMatch ? (
+                      <>
+                        <span className="btn-spinner" /> Matching Job…
+                      </>
+                    ) : (
+                      <>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                          <circle cx="11" cy="11" r="8" />
+                          <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                        </svg>
+                        Match Job
+                      </>
+                    )}
+                  </button>
+
+                  <button
                     className="secondary-btn clear-btn"
                     type="button"
                     onClick={clearForm}
                     disabled={busy}
-                    title="Clear input and delete saved SQLite review row"
+                    title="Clear input and delete saved review record"
                   >
                     Clear Form
                   </button>
@@ -669,7 +810,7 @@ export default function App() {
               </div>
             </section>
 
-            {/* Audit Results Dashboard */}
+            {/* Results Section */}
             <section className="results-container" aria-live="polite">
               {/* EMPTY STATE */}
               {status === "empty" && (
@@ -679,22 +820,22 @@ export default function App() {
                       <div className="step-box">
                         <span className="step-num">01</span>
                         <h4>Upload DOCX</h4>
-                        <p>Upload a standard Word CV document or pick a benchmark above.</p>
+                        <p>Upload a standard Word CV document or pick a benchmark profile above.</p>
                       </div>
                       <div className="step-box">
                         <span className="step-num">02</span>
-                        <h4>Match Role</h4>
-                        <p>Optionally supply target requirements for ATS keyword alignment.</p>
+                        <h4>Paste Job Specs</h4>
+                        <p>Optionally supply target requirements for skill and keyword gap analysis.</p>
                       </div>
                       <div className="step-box">
                         <span className="step-num">03</span>
-                        <h4>Review Suggestions</h4>
-                        <p>Receive up to 6 actionable suggestions and fact-checked improvements.</p>
+                        <h4>AI Review & Match</h4>
+                        <p>Review suggestions with accept/reject/edit controls and matched skills.</p>
                       </div>
                       <div className="step-box">
                         <span className="step-num">04</span>
                         <h4>Edit & Export</h4>
-                        <p>Refine your text in the live editor and export clean plain text.</p>
+                        <p>Refine your text in the live editor and export clean plain text (.txt).</p>
                       </div>
                     </div>
                   </div>
@@ -707,7 +848,7 @@ export default function App() {
                   <div className="loading-orbit">
                     <span className="orbit-spinner" />
                   </div>
-                  <h3 className="loading-title">Analyzing Your Document</h3>
+                  <h3 className="loading-title">{loadingMessage}</h3>
                   <div className="loading-steps-indicator">
                     <div className={`step-item ${loadingStep >= 1 ? "done" : ""}`}>
                       <span className="step-bullet">{loadingStep > 1 ? "✓" : "1"}</span>
@@ -715,11 +856,11 @@ export default function App() {
                     </div>
                     <div className={`step-item ${loadingStep >= 2 ? "done" : ""}`}>
                       <span className="step-bullet">{loadingStep > 2 ? "✓" : "2"}</span>
-                      <span>Auditing action verbs, quantified metrics & keywords…</span>
+                      <span>Auditing action verbs, clarity, grammar & keywords…</span>
                     </div>
                     <div className={`step-item ${loadingStep >= 3 ? "done" : ""}`}>
                       <span className="step-bullet">3</span>
-                      <span>Formulating actionable suggestions…</span>
+                      <span>Formulating actionable suggestions & gap analysis…</span>
                     </div>
                   </div>
                 </div>
@@ -736,14 +877,15 @@ export default function App() {
                     </svg>
                   </div>
                   <div className="error-content">
-                    <h3>We couldn't complete the CV review</h3>
+                    <h3>Action Could Not Be Completed</h3>
                     <p className="error-msg">{error}</p>
                     <div className="error-checklist">
                       <strong>Troubleshooting Checklist:</strong>
                       <ul>
-                        <li>Confirm the file has a <code>.docx</code> extension (PDF is not supported in MVP).</li>
+                        <li>Confirm the file has a <code>.docx</code> extension (PDF not supported in MVP).</li>
                         <li>Ensure the file is not corrupted, password-protected, or exceeding 5 MB.</li>
                         <li>Verify the FastAPI backend is running at <code>http://127.0.0.1:8000</code>.</li>
+                        <li>For Job Matching, ensure both CV text and Job Description are supplied.</li>
                       </ul>
                     </div>
                   </div>
@@ -751,131 +893,386 @@ export default function App() {
               )}
 
               {/* SUCCESS STATE */}
-              {status === "success" && result && (
+              {status === "success" && (
                 <div className="audit-results-content">
-                  {/* Summary & Mode Notification */}
-                  <div className={`mode-banner ${result.analysis?.mode === "ai" ? "ai-mode" : "demo-mode"}`}>
-                    <div className="banner-left">
-                      <span className="mode-badge">
-                        {result.analysis?.mode === "ai" ? "🤖 AI Analysis (Groq)" : "🧪 Demo Mode (Local Heuristics)"}
-                      </span>
-                      <p className="banner-summary">{result.analysis?.summary}</p>
-                    </div>
-                    <div className="banner-right">
-                      <span className="review-id-tag">Review ID: #{result.id}</span>
-                      <span className="db-tag">Stored in SQLite</span>
-                    </div>
-                  </div>
-
-                  {/* Fact-check Warning Banner (Mandatory Requirement) */}
+                  {/* Mandatory Review-Before-Use Warning Banner */}
                   <div className="fact-check-alert" role="alert">
                     <div className="alert-icon">⚠️</div>
                     <div className="alert-text">
-                      <strong>Mandatory Fact-Check Reminder:</strong>
-                      <span>
-                        Carefully review every AI suggestion. AI can produce inaccuracies or hallucinations. Keep only
-                        revisions that are truthful, accurate, and genuinely reflect your own professional experience.
-                        Never invent metrics, degrees, or skills you do not possess.
-                      </span>
+                      <strong>Review Before Use Warning:</strong>
+                      <p style={{ marginTop: "4px", fontSize: "0.95rem" }}>
+                        "AI-generated suggestions may contain errors. Verify every statement, skill, qualification,
+                        date, and achievement before using it in your CV. Only include claims that accurately reflect
+                        your real experience."
+                      </p>
                     </div>
                   </div>
 
-                  {/* Scorecard Dashboard */}
-                  <div className="scorecard-grid">
-                    <div className="scorecard-card overall-card">
-                      <div className="score-ring-wrapper">
-                        <div className="score-ring">
-                          <span className="score-value">{metrics.score}</span>
-                          <span className="score-max">/100</span>
+                  {/* Summary & Mode Notification */}
+                  <div className={`mode-banner ${result?.analysis?.mode === "ai" || jobMatch?.mode === "ai" ? "ai-mode" : "demo-mode"}`}>
+                    <div className="banner-left">
+                      <span className="mode-badge">
+                        {result?.analysis?.mode === "ai" || jobMatch?.mode === "ai"
+                          ? "🤖 AI Analysis (Groq LLM Active)"
+                          : "🧪 Demo Mode (Local Heuristics Active)"}
+                      </span>
+                      <p className="banner-summary">
+                        {result?.analysis?.summary || jobMatch?.evidence_summary || "Review the suggestions and match analysis below."}
+                      </p>
+                    </div>
+                    {result?.id && (
+                      <div className="banner-right">
+                        <span className="review-id-tag">Review ID: #{result.id}</span>
+                        <span className="db-tag">Stored in SQLite</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* FEATURE 2: JOB MATCHING RESULTS SECTION */}
+                  {jobMatch && (
+                    <div className="job-match-section glass-panel" style={{ marginTop: "24px", padding: "24px" }}>
+                      <div className="job-match-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "16px", marginBottom: "20px" }}>
+                        <div>
+                          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                            <span className="eyebrow-chip" style={{ background: "rgba(16, 185, 129, 0.15)", color: "var(--success)" }}>
+                              FEATURE 2: JOB MATCHING
+                            </span>
+                            <h3 className="section-title" style={{ margin: 0 }}>CV & Job Description Alignment</h3>
+                          </div>
+                          <p className="section-subtitle" style={{ marginTop: "6px" }}>
+                            Comparison of your CV against target role specifications, required skills, and keyword gaps.
+                          </p>
+                        </div>
+
+                        {/* Coverage Score Card */}
+                        <div className="score-coverage-card" style={{ background: "var(--input-bg)", padding: "14px 20px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-subtle)", textAlign: "center", minWidth: "220px" }}>
+                          <div style={{ fontSize: "2rem", fontWeight: 700, color: "var(--primary)" }}>
+                            {jobMatch.matching_score}%
+                          </div>
+                          <div style={{ fontSize: "0.85rem", fontWeight: 600, color: "var(--text-muted)" }}>
+                            Requirement Coverage Score
+                          </div>
+                          <div style={{ fontSize: "0.75rem", color: "var(--text-dim)", marginTop: "4px", lineHeight: "1.3" }}>
+                            {jobMatch.score_explanation}
+                          </div>
                         </div>
                       </div>
-                      <div className="score-meta">
-                        <h4>ATS Readiness Score</h4>
-                        <p>Calculated from action verb strength, quantified results, and section structure.</p>
+
+                      <div className="job-match-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "20px" }}>
+                        {/* 1. Matched Skills with Evidence */}
+                        <div className="match-card" style={{ background: "rgba(16, 185, 129, 0.05)", border: "1px solid rgba(16, 185, 129, 0.2)", borderRadius: "var(--radius-md)", padding: "18px" }}>
+                          <h4 style={{ color: "var(--success)", display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px" }}>
+                            <span>✓</span> Matched Skills & Requirements ({jobMatch.matched_skills?.length || 0})
+                          </h4>
+                          {jobMatch.matched_skills?.length === 0 ? (
+                            <p style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>No direct keyword matches found.</p>
+                          ) : (
+                            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                              {jobMatch.matched_skills.map((m, idx) => (
+                                <div key={idx} style={{ background: "var(--bg-card)", padding: "10px 14px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-subtle)" }}>
+                                  <strong style={{ color: "var(--text-main)", display: "block" }}>{m.skill}</strong>
+                                  <span style={{ fontSize: "0.82rem", color: "var(--text-muted)", fontStyle: "italic" }}>
+                                    Evidence from CV: "{m.evidence}"
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* 2. Possible Gaps (Not Evidenced in CV) */}
+                        <div className="match-card" style={{ background: "rgba(239, 68, 68, 0.05)", border: "1px solid rgba(239, 68, 68, 0.2)", borderRadius: "var(--radius-md)", padding: "18px" }}>
+                          <h4 style={{ color: "var(--danger)", display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+                            <span>✕</span> Possible Gaps (Not Evidenced in CV)
+                          </h4>
+                          <p style={{ fontSize: "0.8rem", color: "var(--text-dim)", marginBottom: "12px", lineHeight: "1.4" }}>
+                            *These requirements were not found in your provided CV text. This does not imply you lack the ability; ensure you mention them if you possess genuine experience.
+                          </p>
+                          {jobMatch.possible_gaps?.length === 0 ? (
+                            <p style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>No critical gaps identified.</p>
+                          ) : (
+                            <ul style={{ paddingLeft: "18px", display: "flex", flexDirection: "column", gap: "8px" }}>
+                              {jobMatch.possible_gaps.map((gap, idx) => (
+                                <li key={idx} style={{ fontSize: "0.88rem", color: "var(--text-muted)" }}>
+                                  {gap}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
                       </div>
-                    </div>
 
-                    <div className="scorecard-card stat-card">
-                      <span className="stat-num">{metrics.wordCount}</span>
-                      <span className="stat-label">Total Words</span>
-                      <span className="stat-sub">Optimal: 400 - 850</span>
-                    </div>
+                      {/* 3. Keywords: Supported vs Requiring Verification */}
+                      <div style={{ marginTop: "20px", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "16px" }}>
+                        <div style={{ background: "var(--bg-card)", padding: "14px 18px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-subtle)" }}>
+                          <h5 style={{ fontSize: "0.9rem", color: "var(--text-main)", marginBottom: "10px" }}>
+                            Keywords Supported by CV Experience:
+                          </h5>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                            {jobMatch.supported_keywords?.map((kw, idx) => (
+                              <span key={idx} className="filter-chip active" style={{ fontSize: "0.8rem", background: "rgba(16, 185, 129, 0.15)", color: "var(--success)", borderColor: "var(--success)" }}>
+                                ✓ {kw}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
 
-                    <div className="scorecard-card stat-card">
-                      <span className="stat-num">{metrics.actionVerbs}</span>
-                      <span className="stat-label">Power Action Verbs</span>
-                      <span className="stat-sub">Identified leadership terms</span>
-                    </div>
+                        <div style={{ background: "var(--bg-card)", padding: "14px 18px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-subtle)" }}>
+                          <h5 style={{ fontSize: "0.9rem", color: "var(--text-main)", marginBottom: "10px" }}>
+                            Keywords Requiring Verification Before Use:
+                          </h5>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                            {jobMatch.verification_keywords?.map((kw, idx) => (
+                              <span key={idx} className="filter-chip" style={{ fontSize: "0.8rem", background: "rgba(245, 158, 11, 0.15)", color: "var(--warning)", borderColor: "var(--warning)" }}>
+                                ⚠️ {kw}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
 
-                    <div className="scorecard-card stat-card">
-                      <span className="stat-num">{metrics.metricsFound}</span>
-                      <span className="stat-label">Quantified Metrics</span>
-                      <span className="stat-sub">Numbers, % or $ values</span>
+                      {/* 4. Recommendations & Uncertain Matches */}
+                      {jobMatch.recommendations?.length > 0 && (
+                        <div style={{ marginTop: "20px", background: "var(--bg-card)", padding: "16px 20px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-subtle)" }}>
+                          <h5 style={{ fontSize: "0.95rem", color: "var(--primary)", marginBottom: "8px" }}>
+                            💡 Honest Recommendations for this Role:
+                          </h5>
+                          <ul style={{ paddingLeft: "20px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                            {jobMatch.recommendations.map((rec, idx) => (
+                              <li key={idx} style={{ fontSize: "0.88rem", color: "var(--text-muted)" }}>{rec}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
                     </div>
+                  )}
 
-                    <div className="scorecard-card stat-card">
-                      <span className="stat-num">{metrics.matchPct}%</span>
-                      <span className="stat-label">Job Alignment</span>
-                      <span className="stat-sub">Role keyword overlap</span>
-                    </div>
-                  </div>
-
-                  {/* Suggestions Section */}
-                  <div className="suggestions-section">
+                  {/* FEATURE 1: AI SUGGESTIONS SECTION WITH INDIVIDUAL CONTROLS */}
+                  <div className="suggestions-section" style={{ marginTop: "32px" }}>
                     <div className="suggestions-header">
                       <div>
-                        <h3 className="section-title">Actionable Writing Suggestions</h3>
-                        <p className="section-subtitle">
-                          Review recommended improvements. Click "Apply to Editor" to incorporate changes instantly.
+                        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                          <span className="eyebrow-chip" style={{ background: "rgba(99, 102, 241, 0.15)", color: "var(--primary)" }}>
+                            FEATURE 1: AI SUGGESTIONS
+                          </span>
+                          <h3 className="section-title" style={{ margin: 0 }}>Actionable Writing & Impact Improvements</h3>
+                        </div>
+                        <p className="section-subtitle" style={{ marginTop: "6px" }}>
+                          Review each recommendation individually. Accept, reject, or edit proposals before incorporating them into your CV.
                         </p>
                       </div>
 
-                      {/* Filter Chips */}
-                      <div className="filter-chips">
-                        {["all", "impact", "clarity", "keyword", "quantif"].map((cat) => (
-                          <button
-                            key={cat}
-                            type="button"
-                            className={`filter-chip ${suggestionCategoryFilter === cat ? "active" : ""}`}
-                            onClick={() => setSuggestionCategoryFilter(cat)}
-                          >
-                            {cat === "all" ? "All Suggestions" : cat.toUpperCase()}
-                          </button>
-                        ))}
+                      {/* Status and Category Filter Controls */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "8px", alignItems: "flex-end" }}>
+                        <div className="filter-chips">
+                          <span style={{ fontSize: "0.8rem", color: "var(--text-dim)", alignSelf: "center", marginRight: "4px" }}>Filter:</span>
+                          {["all", "pending", "accepted", "rejected", "edited"].map((stat) => (
+                            <button
+                              key={stat}
+                              type="button"
+                              className={`filter-chip ${suggestionStatusFilter === stat ? "active" : ""}`}
+                              onClick={() => setSuggestionStatusFilter(stat)}
+                            >
+                              {stat === "all" ? "All Statuses" : stat.toUpperCase()}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     </div>
 
-                    <div className="suggestions-list">
+                    <div className="suggestions-list" style={{ marginTop: "16px" }}>
                       {filteredSuggestions.length === 0 ? (
-                        <div className="no-suggestions">No suggestions found in this category.</div>
+                        <div className="no-suggestions" style={{ padding: "32px", textAlign: "center", color: "var(--text-muted)" }}>
+                          No suggestions found matching the current filter.
+                        </div>
                       ) : (
-                        filteredSuggestions.map((item, index) => (
-                          <article className="suggestion-card" key={index}>
-                            <div className="suggestion-top">
-                              <span className="category-pill">{item.category}</span>
-                              <button
-                                type="button"
-                                className="apply-btn"
-                                onClick={() => applySuggestion(item.original, item.suggested)}
-                                title="Directly substitute this suggestion into the editor below"
-                              >
-                                Apply to Editor →
-                              </button>
+                        filteredSuggestions.map((item) => (
+                          <article
+                            className={`suggestion-card status-${item.status}`}
+                            key={item.id}
+                            style={{
+                              borderLeft: `4px solid ${
+                                item.status === "accepted"
+                                  ? "var(--success)"
+                                  : item.status === "rejected"
+                                  ? "var(--danger)"
+                                  : item.status === "edited"
+                                  ? "var(--accent-sky)"
+                                  : "var(--primary)"
+                              }`
+                            }}
+                          >
+                            <div className="suggestion-top" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                <span className="category-pill">{item.category}</span>
+                                <span
+                                  className={`status-pill pill-${item.status}`}
+                                  style={{
+                                    fontSize: "0.75rem",
+                                    padding: "3px 10px",
+                                    borderRadius: "var(--radius-full)",
+                                    fontWeight: 600,
+                                    textTransform: "uppercase",
+                                    background:
+                                      item.status === "accepted"
+                                        ? "rgba(16, 185, 129, 0.2)"
+                                        : item.status === "rejected"
+                                        ? "rgba(239, 68, 68, 0.2)"
+                                        : item.status === "edited"
+                                        ? "rgba(56, 189, 248, 0.2)"
+                                        : "rgba(245, 158, 11, 0.2)",
+                                    color:
+                                      item.status === "accepted"
+                                        ? "var(--success)"
+                                        : item.status === "rejected"
+                                        ? "var(--danger)"
+                                        : item.status === "edited"
+                                        ? "var(--accent-sky)"
+                                        : "var(--warning)"
+                                  }}
+                                >
+                                  {item.status}
+                                </span>
+                              </div>
+
+                              {/* Individual User Controls: Accept, Reject, Edit */}
+                              <div style={{ display: "flex", gap: "8px" }}>
+                                <button
+                                  type="button"
+                                  className="action-control-btn accept-btn"
+                                  onClick={() => handleAcceptSuggestion(item.id)}
+                                  disabled={item.status === "accepted"}
+                                  title="Accept this suggestion and apply it into your CV editor draft"
+                                  style={{
+                                    background: "rgba(16, 185, 129, 0.15)",
+                                    color: "var(--success)",
+                                    border: "1px solid rgba(16, 185, 129, 0.4)",
+                                    padding: "6px 14px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontWeight: 600,
+                                    cursor: "pointer",
+                                    fontSize: "0.85rem"
+                                  }}
+                                >
+                                  ✓ Accept
+                                </button>
+
+                                <button
+                                  type="button"
+                                  className="action-control-btn reject-btn"
+                                  onClick={() => handleRejectSuggestion(item.id)}
+                                  disabled={item.status === "rejected"}
+                                  title="Reject this suggestion and keep your original statement"
+                                  style={{
+                                    background: "rgba(239, 68, 68, 0.12)",
+                                    color: "var(--danger)",
+                                    border: "1px solid rgba(239, 68, 68, 0.3)",
+                                    padding: "6px 14px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontWeight: 600,
+                                    cursor: "pointer",
+                                    fontSize: "0.85rem"
+                                  }}
+                                >
+                                  ✕ Reject
+                                </button>
+
+                                <button
+                                  type="button"
+                                  className="action-control-btn edit-btn"
+                                  onClick={() => handleStartEdit(item.id)}
+                                  title="Customize this proposed rewrite before accepting"
+                                  style={{
+                                    background: "rgba(99, 102, 241, 0.12)",
+                                    color: "var(--primary)",
+                                    border: "1px solid rgba(99, 102, 241, 0.3)",
+                                    padding: "6px 14px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontWeight: 600,
+                                    cursor: "pointer",
+                                    fontSize: "0.85rem"
+                                  }}
+                                >
+                                  ✎ Edit
+                                </button>
+                              </div>
                             </div>
 
-                            <div className="comparison-grid">
+                            {/* Issue Identified */}
+                            {item.issue_identified && (
+                              <div style={{ marginTop: "12px", fontSize: "0.88rem", color: "var(--text-muted)" }}>
+                                <strong style={{ color: "var(--text-main)" }}>Issue Identified:</strong> {item.issue_identified}
+                              </div>
+                            )}
+
+                            {/* Side-by-Side Wording Comparison */}
+                            <div className="comparison-grid" style={{ marginTop: "12px" }}>
                               <div className="comparison-col original-box">
-                                <span className="col-label">Original CV Excerpt:</span>
-                                <p className="excerpt-text">{item.original || "—"}</p>
+                                <span className="col-label">Original CV Statement:</span>
+                                <p className="excerpt-text">{item.original_statement || item.original || "—"}</p>
                               </div>
                               <div className="comparison-col suggested-box">
                                 <span className="col-label">Suggested Revision:</span>
-                                <p className="excerpt-text suggested-text">{item.suggested || "—"}</p>
+                                {item.isEditing ? (
+                                  <div style={{ marginTop: "6px" }}>
+                                    <textarea
+                                      className="cv-textarea-editor"
+                                      value={item.editText}
+                                      onChange={(e) => {
+                                        const val = e.target.value;
+                                        setSuggestions((prev) =>
+                                          prev.map((s) => (s.id === item.id ? { ...s, editText: val } : s))
+                                        );
+                                      }}
+                                      rows={4}
+                                      style={{ width: "100%", padding: "8px", fontSize: "0.9rem" }}
+                                    />
+                                    <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                                      <button
+                                        type="button"
+                                        className="primary-btn"
+                                        style={{ padding: "6px 12px", fontSize: "0.85rem" }}
+                                        onClick={() => handleSaveCustomEdit(item.id)}
+                                      >
+                                        Save & Apply Edit
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="secondary-btn"
+                                        style={{ padding: "6px 12px", fontSize: "0.85rem" }}
+                                        onClick={() => handleCancelEdit(item.id)}
+                                      >
+                                        Cancel
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <p className="excerpt-text suggested-text">{item.suggested_rewrite || item.suggested || "—"}</p>
+                                )}
                               </div>
                             </div>
 
-                            <div className="suggestion-reason">
-                              <strong>Why this helps:</strong> {item.reason}
+                            {/* Facts to Verify Banner inside each suggestion */}
+                            {item.facts_to_verify && (
+                              <div
+                                className="verify-facts-box"
+                                style={{
+                                  marginTop: "12px",
+                                  padding: "10px 14px",
+                                  background: "rgba(245, 158, 11, 0.08)",
+                                  borderLeft: "3px solid var(--warning)",
+                                  borderRadius: "4px",
+                                  fontSize: "0.85rem"
+                                }}
+                              >
+                                <strong style={{ color: "var(--warning)" }}>🔍 Facts to Verify:</strong>{" "}
+                                <span style={{ color: "var(--text-muted)" }}>{item.facts_to_verify}</span>
+                              </div>
+                            )}
+
+                            {/* Explanation */}
+                            <div className="suggestion-reason" style={{ marginTop: "10px" }}>
+                              <strong>Why this helps:</strong> {item.explanation || item.reason}
                             </div>
                           </article>
                         ))
@@ -884,7 +1281,7 @@ export default function App() {
                   </div>
 
                   {/* Dual-Pane Editor & Preview */}
-                  <div className="editor-preview-container">
+                  <div className="editor-preview-container" style={{ marginTop: "32px" }}>
                     <div className="editor-header-bar">
                       <div className="editor-title-group">
                         <h3>Interactive CV Text Editor & Preview</h3>
@@ -933,7 +1330,10 @@ export default function App() {
                             <button
                               type="button"
                               className="reset-text-btn"
-                              onClick={() => setEditedText(result.extracted_text)}
+                              onClick={() => {
+                                setEditedText(extractedText);
+                                showToast("Reset text back to original extracted CV.");
+                              }}
                               title="Reset back to raw extracted text"
                             >
                               Reset to Original
